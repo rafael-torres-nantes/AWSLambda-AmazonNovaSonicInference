@@ -24,20 +24,24 @@ def lambda_handler(event, context):
     print('*********** Start Sonic Lambda with Streaming ***************')
     print(f'[DEBUG] Event: {event}')
 
+    # 2 - Obtem o prompt e o voice_id do evento
+    system_prompt = event.get('system_prompt', 'You are a helpful assistant.')
+    voice_id = event.get('voice_id', 'matthew')
+
     try:
-        # 2 - Inicializa o serviço Amazon Nova Sonic Service
+        # 3 - Inicializa o serviço Amazon Nova Sonic Service
         sonic_service = AmazonNovaSonicService()
         loop = asyncio.get_event_loop()
 
-        # 3 - Inicia a sessão de streaming e as tarefas de reprodução e captura
+        # 4 - Inicia a sessão de streaming e as tarefas de reprodução e captura
         loop.run_until_complete(sonic_service.start_session())
         playback_task = loop.create_task(sonic_service.play_audio())
         capture_task = loop.create_task(sonic_service.capture_audio())
 
-        # 4 - Aguarda o término das tarefas de reprodução e captura
+        # 5 - Aguarda o término das tarefas de reprodução e captura
         loop.run_until_complete(asyncio.gather(playback_task, capture_task))
 
-        # 5 - Finaliza a sessão e obtém o áudio gerado
+        # 6 - Finaliza a sessão e obtém o áudio gerado
         loop.run_until_complete(sonic_service.end_session())
 
         return {
