@@ -3,204 +3,374 @@ import asyncio
 import base64
 import json
 import uuid
-import wave
-from dotenv import load_dotenv
+import pyaudio
+from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
+from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
+from aws_sdk_bedrock_runtime.config import Config
+from smithy_aws_core.identity.environment import EnvironmentCredentialsResolver
 
-from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient
-from aws_sdk_bedrock_runtime.config import Config, HTTPAuthSchemeResolver, SigV4AuthScheme
-from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart, InvokeModelWithBidirectionalStreamOperationInput
-from smithy_aws_core.credentials_resolvers.environment import EnvironmentCredentialsResolver
-
-load_dotenv()
+# Audio configuration
+INPUT_SAMPLE_RATE = 16000
+OUTPUT_SAMPLE_RATE = 24000
+CHANNELS = 1
+FORMAT = pyaudio.paInt16
+CHUNK_SIZE = 1024
 
 class AmazonNovaSonicService:
-    """
-    Classe de serviço otimizada para gerenciar a interação com o Amazon Nova Sonic.
-    Esta versão aceita dados de áudio diretamente em memória (bytes).
-    """
     def __init__(self, model_id='amazon.nova-sonic-v1:0', region='us-east-1'):
         self.model_id = model_id
         self.region = region
         self.client = None
-        self.stream_response = None
+        self.stream = None
+        self.response = None
         self.is_active = False
-        self.audio_output_queue = asyncio.Queue()
-        self.transcription = ""
         self.prompt_name = str(uuid.uuid4())
+        self.content_name = str(uuid.uuid4())
         self.audio_content_name = str(uuid.uuid4())
+        self.audio_queue = asyncio.Queue()
+        self.role = None
+        self.display_assistant_text = False
         
-        self.chunks_sent = 0
-        self.chunks_received = 0
-        self.chunks_written = 0
-        
-        print(f"[DEBUG][SONIC_SERVICE] Serviço inicializado para o modelo: {self.model_id} na região {self.region}")
-
-    # ... (os métodos _initialize_client, _send_event, e _start_and_configure_session permanecem os mesmos) ...
     def _initialize_client(self):
-        if self.client: return
-        print("[DEBUG][SONIC_SERVICE] Inicializando cliente Bedrock para streaming...")
+        """Initialize the Bedrock client."""
         config = Config(
             endpoint_uri=f"https://bedrock-runtime.{self.region}.amazonaws.com",
             region=self.region,
             aws_credentials_identity_resolver=EnvironmentCredentialsResolver(),
-            http_auth_scheme_resolver=HTTPAuthSchemeResolver(),
-            http_auth_schemes={"aws.auth#sigv4": SigV4AuthScheme()}
         )
         self.client = BedrockRuntimeClient(config=config)
-
-    async def _send_event(self, event_data: dict):
-        try:
-            event_json = json.dumps(event_data)
-            chunk = InvokeModelWithBidirectionalStreamInputChunk(
-                value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
-            )
-            await self.stream_response.input_stream.send(chunk)
-        except Exception as e:
-            print(f"[ERROR][SONIC_SERVICE] Falha ao enviar evento: {e}")
-            raise
-
-    async def _start_and_configure_session(self, system_prompt: str, voice_id: str):
-        self._initialize_client()
-        self.stream_response = await self.client.invoke_model_with_bidirectional_stream(
+    
+    async def send_event(self, event_json):
+        """Send an event to the stream."""
+        event = InvokeModelWithBidirectionalStreamInputChunk(
+            value=BidirectionalInputPayloadPart(bytes_=event_json.encode('utf-8'))
+        )
+        await self.stream.input_stream.send(event)
+    
+    async def start_session(self):
+        """Start a new session with Nova Sonic."""
+        if not self.client:
+            self._initialize_client()
+            
+        # Initialize the stream
+        self.stream = await self.client.invoke_model_with_bidirectional_stream(
             InvokeModelWithBidirectionalStreamOperationInput(model_id=self.model_id)
         )
         self.is_active = True
-        print("[DEBUG][SONIC_SERVICE] Sessão de streaming estabelecida.")
-
-        session_start_event = {"event": {"sessionStart": {"inferenceConfiguration": {"maxTokens": 1024, "temperature": 0.7}}}}
-        await self._send_event(session_start_event)
-
-        prompt_start_event = {
-            "event": {"promptStart": {"promptName": self.prompt_name,
-                "audioOutputConfiguration": {
-                    "mediaType": "audio/lpcm", "sampleRateHertz": 24000,
-                    "sampleSizeBits": 16, "channelCount": 1,
-                    "voiceId": voice_id, "encoding": "base64", "audioType": "SPEECH"
-                }}}}
-        await self._send_event(prompt_start_event)
         
-        system_prompt_content_name = str(uuid.uuid4())
-        await self._send_event({"event": {"contentStart": {"promptName": self.prompt_name, "contentName": system_prompt_content_name, "type": "TEXT", "role": "SYSTEM", "textInputConfiguration": {"mediaType": "text/plain"}}}})
-        await self._send_event({"event": {"textInput": {"promptName": self.prompt_name, "contentName": system_prompt_content_name, "content": system_prompt}}})
-        await self._send_event({"event": {"contentEnd": {"promptName": self.prompt_name, "contentName": system_prompt_content_name}}})
+        # Send session start event
+        session_start = '''
+        {
+          "event": {
+            "sessionStart": {
+              "inferenceConfiguration": {
+                "maxTokens": 1024,
+                "topP": 0.9,
+                "temperature": 0.7
+              }
+            }
+          }
+        }
+        '''
+        await self.send_event(session_start)
         
-        print(f"[DEBUG][SONIC_SERVICE] Sessão configurada com prompt: '{system_prompt}' e voz: '{voice_id}'")
+        # Send prompt start event
+        prompt_start = f'''
+        {{
+          "event": {{
+            "promptStart": {{
+              "promptName": "{self.prompt_name}",
+              "textOutputConfiguration": {{
+                "mediaType": "text/plain"
+              }},
+              "audioOutputConfiguration": {{
+                "mediaType": "audio/lpcm",
+                "sampleRateHertz": 24000,
+                "sampleSizeBits": 16,
+                "channelCount": 1,
+                "voiceId": "matthew",
+                "encoding": "base64",
+                "audioType": "SPEECH"
+              }}
+            }}
+          }}
+        }}
+        '''
+        await self.send_event(prompt_start)
+        
+        # Send system prompt
+        text_content_start = f'''
+        {{
+            "event": {{
+                "contentStart": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}",
+                    "type": "TEXT",
+                    "interactive": false,
+                    "role": "SYSTEM",
+                    "textInputConfiguration": {{
+                        "mediaType": "text/plain"
+                    }}
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(text_content_start)
+        
+        system_prompt = "You are a friendly assistant. The user and you will engage in a spoken dialog " \
+            "exchanging the transcripts of a natural real-time conversation. Keep your responses short, " \
+            "generally two or three sentences for chatty scenarios."
+        
 
 
-    async def _stream_audio_from_bytes(self, audio_bytes: bytes):
-        """
-        Divide um objeto de bytes de áudio em pedaços (chunks), codifica em base64
-        e os envia em sequência através do stream para o modelo.
-
-        Args:
-            audio_bytes (bytes): Os dados brutos do áudio (sem cabeçalho WAV).
+        text_input = f'''
+        {{
+            "event": {{
+                "textInput": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}",
+                    "content": "{system_prompt}"
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(text_input)
         
-        Returns:
-            None
-        """
-        print(f"[DEBUG][SONIC_SERVICE] Iniciando streaming a partir de {len(audio_bytes)} bytes em memória.")
+        text_content_end = f'''
+        {{
+            "event": {{
+                "contentEnd": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.content_name}"
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(text_content_end)
         
-        audio_start_event = {
-            "event": {"contentStart": {"promptName": self.prompt_name, "contentName": self.audio_content_name, "type": "AUDIO", "role": "USER", "interactive": True,
-                "audioInputConfiguration": {
-                    "mediaType": "audio/lpcm", "sampleRateHertz": 16000,
-                    "sampleSizeBits": 16, "channelCount": 1,
-                    "audioType": "SPEECH", "encoding": "base64"
-                }}}}
-        await self._send_event(audio_start_event)
+        # Start processing responses
+        self.response = asyncio.create_task(self._process_responses())
+    
+    async def start_audio_input(self):
+        """Start audio input stream."""
+        audio_content_start = f'''
+        {{
+            "event": {{
+                "contentStart": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}",
+                    "type": "AUDIO",
+                    "interactive": true,
+                    "role": "USER",
+                    "audioInputConfiguration": {{
+                        "mediaType": "audio/lpcm",
+                        "sampleRateHertz": 16000,
+                        "sampleSizeBits": 16,
+                        "channelCount": 1,
+                        "audioType": "SPEECH",
+                        "encoding": "base64"
+                    }}
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(audio_content_start)
+    
+    async def send_audio_chunk(self, audio_bytes):
+        """Send an audio chunk to the stream."""
+        if not self.is_active:
+            return
+            
+        blob = base64.b64encode(audio_bytes)
+        audio_event = f'''
+        {{
+            "event": {{
+                "audioInput": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}",
+                    "content": "{blob.decode('utf-8')}"
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(audio_event)
+    
+    async def end_audio_input(self):
+        """End audio input stream."""
+        audio_content_end = f'''
+        {{
+            "event": {{
+                "contentEnd": {{
+                    "promptName": "{self.prompt_name}",
+                    "contentName": "{self.audio_content_name}"
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(audio_content_end)
+    
+    async def end_session(self):
+        """End the session."""
+        if not self.is_active:
+            return
+            
+        prompt_end = f'''
+        {{
+            "event": {{
+                "promptEnd": {{
+                    "promptName": "{self.prompt_name}"
+                }}
+            }}
+        }}
+        '''
+        await self.send_event(prompt_end)
         
-        chunk_size = 1024 * 2
-        for i in range(0, len(audio_bytes), chunk_size):
-            chunk = audio_bytes[i:i + chunk_size]
-            encoded_chunk = base64.b64encode(chunk).decode('utf-8')
-            await self._send_event({"event": {"audioInput": {"promptName": self.prompt_name, "contentName": self.audio_content_name, "content": encoded_chunk}}})
-            self.chunks_sent += 1
-            await asyncio.sleep(0.05)
-        
-        await self._send_event({"event": {"contentEnd": {"promptName": self.prompt_name, "contentName": self.audio_content_name}}})
-        print(f"[DEBUG][SONIC_SERVICE] Streaming a partir de bytes finalizado. Total de chunks enviados: {self.chunks_sent}")
-
-
+        session_end = '''
+        {
+            "event": {
+                "sessionEnd": {}
+            }
+        }
+        '''
+        await self.send_event(session_end)
+        # close the stream
+        await self.stream.input_stream.close()
+    
     async def _process_responses(self):
-        # ... (sem alterações) ...
-        print("[DEBUG][SONIC_SERVICE] Processador de respostas iniciado.")
+        """Process responses from the stream."""
         try:
             while self.is_active:
-                output = await self.stream_response.await_output()
+                output = await self.stream.await_output()
                 result = await output[1].receive()
+                
                 if result.value and result.value.bytes_:
-                    json_data = json.loads(result.value.bytes_.decode('utf-8'))
-                    event = json_data.get('event', {})
-                    if 'textOutput' in event:
-                        self.transcription += event['textOutput']['content']
-                    elif 'audioOutput' in event:
-                        audio_bytes = base64.b64decode(event['audioOutput']['content'])
-                        await self.audio_output_queue.put(audio_bytes)
-                        self.chunks_received += 1
-                    elif 'completionEnd' in event:
-                        print("[DEBUG][SONIC_RESPONSE] Evento 'completionEnd' recebido. Finalizando.")
-                        self.is_active = False
+                    response_data = result.value.bytes_.decode('utf-8')
+                    json_data = json.loads(response_data)
+                    
+                    if 'event' in json_data:
+                        # Handle content start event
+                        if 'contentStart' in json_data['event']:
+                            content_start = json_data['event']['contentStart'] 
+                            # set role
+                            self.role = content_start['role']
+                            # Check for speculative content
+                            if 'additionalModelFields' in content_start:
+                                additional_fields = json.loads(content_start['additionalModelFields'])
+                                if additional_fields.get('generationStage') == 'SPECULATIVE':
+                                    self.display_assistant_text = True
+                                else:
+                                    self.display_assistant_text = False
+                                
+                        # Handle text output event
+                        elif 'textOutput' in json_data['event']:
+                            text = json_data['event']['textOutput']['content']    
+                           
+                            if (self.role == "ASSISTANT" and self.display_assistant_text):
+                                print(f"Assistant: {text}")
+                            elif self.role == "USER":
+                                print(f"User: {text}")
+                        
+                        # Handle audio output
+                        elif 'audioOutput' in json_data['event']:
+                            audio_content = json_data['event']['audioOutput']['content']
+                            audio_bytes = base64.b64decode(audio_content)
+                            await self.audio_queue.put(audio_bytes)
         except Exception as e:
-            if "stream has been closed" not in str(e) and "cancellation" not in str(e).lower():
-                print(f"[ERROR][SONIC_SERVICE] Erro ao processar respostas: {e}")
-            self.is_active = False
-        finally:
-            await self.audio_output_queue.put(None)
-            print(f"[DEBUG][SONIC_SERVICE] Processador de respostas finalizado. Total de chunks de áudio recebidos: {self.chunks_received}")
-
-    async def _save_response_audio_to_file(self, output_file_path: str):
-        # ... (sem alterações) ...
-        print(f"[DEBUG][SONIC_SERVICE] Aguardando áudio para salvar em: {output_file_path}")
-        with wave.open(output_file_path, 'wb') as output_wav:
-            output_wav.setnchannels(1)
-            output_wav.setsampwidth(2)
-            output_wav.setframerate(24000)
-            while True:
-                audio_chunk = await self.audio_output_queue.get()
-                if audio_chunk is None: break
-                output_wav.writeframes(audio_chunk)
-                self.chunks_written += 1
-        file_size = os.path.getsize(output_file_path)
-        print(f"✅ [SUCCESS] Áudio de resposta salvo. Chunks escritos: {self.chunks_written}. Tamanho do arquivo: {file_size / 1024:.2f} KB")
-
-    async def _end_session(self):
-        # ... (sem alterações) ...
-        if not self.stream_response: return
-        print("[DEBUG][SONIC_SERVICE] Encerrando sessão...")
+            print(f"Error processing responses: {e}")
+    
+    async def play_audio(self):
+        """Play audio responses."""
+        p = pyaudio.PyAudio()
+        stream = p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=OUTPUT_SAMPLE_RATE,
+            output=True
+        )
+        
         try:
-            await self._send_event({"event": {"promptEnd": {"promptName": self.prompt_name}}})
-            await self._send_event({"event": {"sessionEnd": {}}})
-            await self.stream_response.input_stream.close()
-            print("[DEBUG][SONIC_SERVICE] Sessão encerrada.")
+            while self.is_active:
+                audio_data = await self.audio_queue.get()
+                stream.write(audio_data)
         except Exception as e:
-            print(f"[WARNING] Erro menor ao encerrar a sessão (pode ser normal se já fechada pelo servidor): {e}")
-
-    async def process_audio_from_bytes(self, audio_bytes: bytes, output_file_path: str, system_prompt: str, voice_id: str = "matthew"):
-        """
-        Método público que orquestra o processo a partir de dados de áudio em memória.
-
-        Args:
-            audio_bytes (bytes): Os dados do áudio de entrada (sem cabeçalho).
-            output_file_path (str): Caminho para salvar o arquivo .wav de saída.
-            system_prompt (str): A instrução de comportamento para o assistente.
-            voice_id (str): O ID da voz para a resposta.
-            
-        Returns:
-            str: A transcrição em texto da resposta do assistente.
-        """
-        try:
-            await self._start_and_configure_session(system_prompt, voice_id)
-            
-            response_task = asyncio.create_task(self._process_responses())
-            save_audio_task = asyncio.create_task(self._save_response_audio_to_file(output_file_path))
-            
-            # Chama o novo método que transmite a partir de bytes
-            await self._stream_audio_from_bytes(audio_bytes)
-
-            await response_task
-            await save_audio_task
-            
-            return self.transcription.strip()
+            print(f"Error playing audio: {e}")
         finally:
-            self.is_active = False
-            await self._end_session()
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            print("Audio playing stopped.")
+
+    async def capture_audio(self):
+        """Capture audio from microphone and send to Nova Sonic."""
+        p = pyaudio.PyAudio()
+        stream = p.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=INPUT_SAMPLE_RATE,
+            input=True,
+            frames_per_buffer=CHUNK_SIZE
+        )
+        
+        print("Starting audio capture. Speak into your microphone...")
+        print("Press Enter to stop...")
+        
+        await self.start_audio_input()
+        
+        try:
+            while self.is_active:
+                audio_data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                await self.send_audio_chunk(audio_data)
+                await asyncio.sleep(0.01)
+        except Exception as e:
+            print(f"Error capturing audio: {e}")
+        finally:
+            stream.stop_stream()
+            stream.close()
+            p.terminate()
+            print("Audio capture stopped.")
+            await self.end_audio_input()
+
+async def main():
+    # Create Nova Sonic client
+    nova_client = AmazonNovaSonicService()
+    
+    # Start session
+    await nova_client.start_session()
+    
+    # Start audio playback task
+    playback_task = asyncio.create_task(nova_client.play_audio())
+    
+    # Start audio capture task
+    capture_task = asyncio.create_task(nova_client.capture_audio())
+    
+    # Wait for user to press Enter to stop
+    await asyncio.get_event_loop().run_in_executor(None, input)
+        
+    # First cancel the tasks
+    tasks = []
+    if not playback_task.done():
+        tasks.append(playback_task)
+    if not capture_task.done():
+        tasks.append(capture_task)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    
+    # End session
+    await nova_client.end_session()
+    nova_client.is_active = False
+
+    # cancel the response task
+    if nova_client.response and not nova_client.response.done():
+        nova_client.response.cancel()
+
+    print("Session ended")
+
+if __name__ == "__main__":
+    # Set AWS credentials if not using environment variables
+    # os.environ['AWS_ACCESS_KEY_ID'] = "your-access-key"
+    # os.environ['AWS_SECRET_ACCESS_KEY'] = "your-secret-key"
+    # os.environ['AWS_DEFAULT_REGION'] = "us-east-1"
+
+    asyncio.run(main())
